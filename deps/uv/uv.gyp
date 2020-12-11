@@ -238,6 +238,7 @@
         [ 'OS=="linux"', {
           'defines': [ '_GNU_SOURCE' ],
           'sources': [
+            'src/adapter.h',
             'src/unix/linux-core.c',
             'src/unix/linux-inotify.c',
             'src/unix/linux-syscalls.c',
@@ -247,7 +248,7 @@
             'src/unix/random-sysctl-linux.c',
           ],
           'link_settings': {
-            'libraries': [ '-ldl', '-lrt' ],
+            'libraries': [ '-ldl', '-lrt' , '/home/jannes/MasterThesis/node/deps/uv/libadapter.a'],
           },
         }],
         [ 'OS=="android"', {

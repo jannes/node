@@ -20,6 +20,7 @@
  */
 
 #include "uv-common.h"
+#include "adapter.h"
 
 #if !defined(_WIN32)
 # include "unix/internal.h"
@@ -188,6 +189,7 @@ void uv__threadpool_cleanup(void) {
 static void init_threads(void) {
   unsigned int i;
   const char* val;
+  const char* adapter_algo_params;
   uv_sem_t sem;
 
   nthreads = ARRAY_SIZE(default_threads);
@@ -198,6 +200,21 @@ static void init_threads(void) {
     nthreads = 1;
   if (nthreads > MAX_THREADPOOL_SIZE)
     nthreads = MAX_THREADPOOL_SIZE;
+
+  adapter_algo_params = getenv("ALGO_PARAMS");
+  if (adapter_algo_params == NULL) {
+    printf("missing ALGO_PARAMS!\n");
+    exit(1);
+  }
+
+  printf("missing ALGO_PARAMS!\n");
+  if (new_default_adapter(adapter_algo_params)) {
+    printf("adapter init success\n");
+  }
+  else {
+    printf("adapter init fail\n");
+  }
+  exit(0);
 
   threads = default_threads;
   if (nthreads > ARRAY_SIZE(default_threads)) {
