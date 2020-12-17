@@ -27,6 +27,9 @@
 #endif
 
 #include <stdlib.h>
+
+#include <unistd.h>
+#include <syscall.h>
 #include <time.h>
 
 #define MAX_THREADPOOL_SIZE 1024
@@ -96,6 +99,8 @@ static void worker(void* arg) {
   int cond_ret;
   QUEUE* q;
   int is_slow_work;
+  pid_t worker_tid = syscall(__NR_gettid);
+  add_tracee(worker_tid);
 
   if (arg != NULL)
     uv_sem_post((uv_sem_t*) arg);
@@ -136,9 +141,6 @@ static void worker(void* arg) {
     q = QUEUE_HEAD(&wq);
     if (q == &exit_message) {
       printf("worker exit\n");
-      nthreads -= 1;
-      uv_cond_signal(&cond);
-      uv_mutex_unlock(&mutex);
       break;
     }
 
@@ -159,9 +161,6 @@ static void worker(void* arg) {
     if (q == &terminate_command) {
       if (nthreads > 1) {
         printf("worker terminate\n");
-        nthreads -= 1;
-        uv_cond_signal(&cond);
-        uv_mutex_unlock(&mutex);
         break;
       }
       continue;
@@ -217,6 +216,10 @@ static void worker(void* arg) {
       slow_io_work_running--;
     }
   }
+  nthreads -= 1;
+  remove_tracee(worker_tid);
+  uv_cond_signal(&cond);
+  uv_mutex_unlock(&mutex);
 }
 
 
