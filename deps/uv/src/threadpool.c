@@ -36,12 +36,13 @@ static uv_mutex_t mutex;
 static unsigned int idle_threads;
 static unsigned int slow_io_work_running;
 static unsigned int nthreads;
-static uv_thread_t* threads;
-static uv_thread_t default_threads[4];
+static uv_thread_t thread_handle_dummy;
 static QUEUE exit_message;
 static QUEUE wq;
 static QUEUE run_slow_work_message;
 static QUEUE slow_io_pending_wq;
+static QUEUE clone_command;
+static QUEUE terminate_command;
 
 static unsigned int slow_work_thread_threshold(void) {
   return (nthreads + 1) / 2;
@@ -60,10 +61,12 @@ static void worker(void* arg) {
   QUEUE* q;
   int is_slow_work;
 
-  uv_sem_post((uv_sem_t*) arg);
+  if (arg != NULL)
+    uv_sem_post((uv_sem_t*) arg);
   arg = NULL;
 
   uv_mutex_lock(&mutex);
+  nthreads += 1;
   for (;;) {
     /* `mutex` should always be locked at this point. */
 
@@ -87,6 +90,21 @@ static void worker(void* arg) {
 
     QUEUE_REMOVE(q);
     QUEUE_INIT(q);  /* Signal uv_cancel() that the work req is executing. */
+
+    if (q == &clone_command) {
+        nthreads += 1;
+        uv_thread_create(&thread_handle_dummy, worker, NULL);
+        continue;
+    }
+
+    if (q == &terminate_command) {
+      if (nthreads > 1) {
+        nthreads -= 1;
+        uv_cond_signal(&cond);
+        uv_mutex_unlock(&mutex);
+        break;
+      }
+    }
 
     is_slow_work = 0;
     if (q == &run_slow_work_message) {
@@ -140,6 +158,20 @@ static void worker(void* arg) {
 }
 
 
+/* command must be terminate/clone command as defined above */
+static void push_commands(size_t n, QUEUE *command) {
+  size_t i;
+  uv_mutex_lock(&mutex);
+  for (i = 0; i < n; i++)
+  {
+    QUEUE_INSERT_HEAD(&wq, command);
+  }
+  if (idle_threads > 0)
+    uv_cond_signal(&cond);
+  uv_mutex_unlock(&mutex);
+}
+
+
 static void post(QUEUE* q, enum uv__work_kind kind) {
   uv_mutex_lock(&mutex);
   if (kind == UV__WORK_SLOW_IO) {
@@ -163,51 +195,33 @@ static void post(QUEUE* q, enum uv__work_kind kind) {
 
 void uv__threadpool_cleanup(void) {
 #ifndef _WIN32
-  unsigned int i;
-
   if (nthreads == 0)
     return;
 
   post(&exit_message, UV__WORK_CPU);
 
-  for (i = 0; i < nthreads; i++)
-    if (uv_thread_join(threads + i))
-      abort();
-
-  if (threads != default_threads)
-    uv__free(threads);
-
+  while (nthreads > 0)
+  {
+    uv_sleep(10);
+  }
+  
   uv_mutex_destroy(&mutex);
   uv_cond_destroy(&cond);
-
-  threads = NULL;
-  nthreads = 0;
 #endif
 }
 
 
 static void init_threads(void) {
-  unsigned int i;
-  const char* val;
   const char* adapter_algo_params;
   uv_sem_t sem;
 
-  nthreads = ARRAY_SIZE(default_threads);
-  val = getenv("UV_THREADPOOL_SIZE");
-  if (val != NULL)
-    nthreads = atoi(val);
-  if (nthreads == 0)
-    nthreads = 1;
-  if (nthreads > MAX_THREADPOOL_SIZE)
-    nthreads = MAX_THREADPOOL_SIZE;
-
+  nthreads = 0;
   adapter_algo_params = getenv("ALGO_PARAMS");
   if (adapter_algo_params == NULL) {
     printf("missing ALGO_PARAMS!\n");
     exit(1);
   }
 
-  printf("missing ALGO_PARAMS!\n");
   if (new_default_adapter(adapter_algo_params)) {
     printf("adapter init success\n");
   }
@@ -215,15 +229,6 @@ static void init_threads(void) {
     printf("adapter init fail\n");
   }
   exit(0);
-
-  threads = default_threads;
-  if (nthreads > ARRAY_SIZE(default_threads)) {
-    threads = uv__malloc(nthreads * sizeof(threads[0]));
-    if (threads == NULL) {
-      nthreads = ARRAY_SIZE(default_threads);
-      threads = default_threads;
-    }
-  }
 
   if (uv_cond_init(&cond))
     abort();
@@ -238,13 +243,10 @@ static void init_threads(void) {
   if (uv_sem_init(&sem, 0))
     abort();
 
-  for (i = 0; i < nthreads; i++)
-    if (uv_thread_create(threads + i, worker, &sem))
-      abort();
+  if (uv_thread_create(&thread_handle_dummy, worker, &sem))
+    abort();
 
-  for (i = 0; i < nthreads; i++)
-    uv_sem_wait(&sem);
-
+  uv_sem_wait(&sem);
   uv_sem_destroy(&sem);
 }
 
