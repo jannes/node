@@ -27,6 +27,7 @@
 #endif
 
 #include <stdlib.h>
+#include <time.h>
 
 #define MAX_THREADPOOL_SIZE 1024
 
@@ -36,6 +37,7 @@ static uv_mutex_t mutex;
 static unsigned int idle_threads;
 static unsigned int slow_io_work_running;
 static unsigned int nthreads;
+static unsigned int wq_size;
 static uv_thread_t thread_handle_dummy;
 static QUEUE exit_message;
 static QUEUE wq;
@@ -52,12 +54,46 @@ static void uv__cancelled(struct uv__work* w) {
   abort();
 }
 
+/* must hold mutex when calling */
+/* command must be terminate/clone command as defined above */
+static void push_commands(size_t n, QUEUE *command) {
+  size_t i;
+  uv_mutex_lock(&mutex);
+  for (i = 0; i < n; i++) {
+    QUEUE_INSERT_HEAD(&wq, command);
+    wq_size += 1;
+  }
+  if (idle_threads > 0)
+    uv_cond_signal(&cond);
+  uv_mutex_unlock(&mutex);
+}
+
+/* must hold mutex when calling */
+static void check_scaling() {
+    int to_scale = get_scaling_advice(wq_size);
+    if (to_scale != 0) {
+        printf("scale advice: %d\n", to_scale);
+        if (nthreads + to_scale <= 0) {
+          to_scale = 1 - nthreads;
+        }
+        else if (nthreads + to_scale > MAX_THREADPOOL_SIZE) {
+          to_scale = MAX_THREADPOOL_SIZE - nthreads;
+        }
+        if (to_scale < 0) {
+          push_commands(-to_scale, &terminate_command);
+        } else {
+          push_commands(to_scale, &clone_command);
+        }
+    } 
+}
 
 /* To avoid deadlock with uv_cancel() it's crucial that the worker
  * never holds the global mutex and the loop-local mutex at the same time.
  */
 static void worker(void* arg) {
   struct uv__work* w;
+  struct timespec ts;
+  int cond_ret;
   QUEUE* q;
   int is_slow_work;
 
@@ -69,6 +105,7 @@ static void worker(void* arg) {
   nthreads += 1;
   for (;;) {
     /* `mutex` should always be locked at this point. */
+    check_scaling();
 
     /* Keep waiting while either no work is present or only slow I/O
        and we're at the threshold for that. */
@@ -77,12 +114,28 @@ static void worker(void* arg) {
             QUEUE_NEXT(&run_slow_work_message) == &wq &&
             slow_io_work_running >= slow_work_thread_threshold())) {
       idle_threads += 1;
-      uv_cond_wait(&cond, &mutex);
+      for (;;) {
+        check_scaling();
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 1;
+        printf("wait for mutex\n");
+        cond_ret = pthread_cond_timedwait(&cond, &mutex, &ts);
+        printf("waited for mutex\n");
+        if (cond_ret == ETIMEDOUT) {
+          uv_mutex_lock(&mutex);
+          continue;
+        }
+        if (cond_ret != 0)
+          abort();
+        else
+          break;
+      } 
       idle_threads -= 1;
     }
 
     q = QUEUE_HEAD(&wq);
     if (q == &exit_message) {
+      printf("worker exit\n");
       nthreads -= 1;
       uv_cond_signal(&cond);
       uv_mutex_unlock(&mutex);
@@ -90,21 +143,28 @@ static void worker(void* arg) {
     }
 
     QUEUE_REMOVE(q);
+    wq_size -= 1;
     QUEUE_INIT(q);  /* Signal uv_cancel() that the work req is executing. */
 
     if (q == &clone_command) {
+      if (nthreads < MAX_THREADPOOL_SIZE)
+      {
+        printf("worker clone\n");
         nthreads += 1;
         uv_thread_create(&thread_handle_dummy, worker, NULL);
-        continue;
+      }
+      continue;
     }
 
     if (q == &terminate_command) {
       if (nthreads > 1) {
+        printf("worker terminate\n");
         nthreads -= 1;
         uv_cond_signal(&cond);
         uv_mutex_unlock(&mutex);
         break;
       }
+      continue;
     }
 
     is_slow_work = 0;
@@ -113,6 +173,7 @@ static void worker(void* arg) {
          other work in the queue is done. */
       if (slow_io_work_running >= slow_work_thread_threshold()) {
         QUEUE_INSERT_TAIL(&wq, q);
+        wq_size += 1;
         continue;
       }
 
@@ -158,19 +219,6 @@ static void worker(void* arg) {
   }
 }
 
-/* command must be terminate/clone command as defined above */
-static void push_commands(size_t n, QUEUE *command) {
-  size_t i;
-  uv_mutex_lock(&mutex);
-  for (i = 0; i < n; i++)
-  {
-    QUEUE_INSERT_HEAD(&wq, command);
-  }
-  if (idle_threads > 0)
-    uv_cond_signal(&cond);
-  uv_mutex_unlock(&mutex);
-}
-
 
 static void post(QUEUE* q, enum uv__work_kind kind) {
   uv_mutex_lock(&mutex);
@@ -187,6 +235,7 @@ static void post(QUEUE* q, enum uv__work_kind kind) {
   }
 
   QUEUE_INSERT_TAIL(&wq, q);
+  wq_size += 1;
   if (idle_threads > 0)
     uv_cond_signal(&cond);
   uv_mutex_unlock(&mutex);
@@ -198,13 +247,16 @@ void uv__threadpool_cleanup(void) {
   if (nthreads == 0)
     return;
 
+  printf("post exit msg\n");
   post(&exit_message, UV__WORK_CPU);
 
+  printf("wait for workers to finish\n");
   while (nthreads > 0)
   {
     uv_sleep(10);
   }
   
+  printf("pool exiting\n");
   uv_mutex_destroy(&mutex);
   uv_cond_destroy(&cond);
 #endif
