@@ -83,6 +83,7 @@ static void worker(void* arg) {
 
     q = QUEUE_HEAD(&wq);
     if (q == &exit_message) {
+      nthreads -= 1;
       uv_cond_signal(&cond);
       uv_mutex_unlock(&mutex);
       break;
@@ -157,7 +158,6 @@ static void worker(void* arg) {
   }
 }
 
-
 /* command must be terminate/clone command as defined above */
 static void push_commands(size_t n, QUEUE *command) {
   size_t i;
@@ -228,7 +228,6 @@ static void init_threads(void) {
   else {
     printf("adapter init fail\n");
   }
-  exit(0);
 
   if (uv_cond_init(&cond))
     abort();
